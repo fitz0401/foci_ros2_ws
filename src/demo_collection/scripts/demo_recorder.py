@@ -24,6 +24,11 @@ import cv2
 from cv_bridge import CvBridge
 from queue import Queue
 
+
+demo_base_dir = '/home/u0177383/doi_policy/foci_real_world/dataset'
+os.makedirs(demo_base_dir, exist_ok=True)
+
+
 class DemoRecorder(Node):
     def __init__(self):
         super().__init__('demo_recorder')
@@ -232,7 +237,7 @@ class DemoRecorder(Node):
             self.get_logger().info(f'Recording frame {frame_idx}... (vel: {velocity:.4f} m/s)')
 
     def save_frame_data(self, frame_idx):
-        demo_dir = f'demo_{self.demo_count:03d}'
+        demo_dir = f'{demo_base_dir}/demo_{self.demo_count:03d}'
         save_data = {
             'demo_dir': demo_dir,
             'frame_idx': frame_idx,
@@ -252,17 +257,19 @@ class DemoRecorder(Node):
                     break
                 demo_dir = save_data['demo_dir']
                 frame_idx = save_data['frame_idx']
+                color_dir = os.path.join(demo_dir, 'color')
+                depth_dir = os.path.join(demo_dir, 'depth')
                 if save_data['color_img'] is not None:
                     try:
                         cv_image = self.bridge.imgmsg_to_cv2(save_data['color_img'], 'bgr8')
-                        color_path = os.path.join(demo_dir, 'color', f'{frame_idx:04d}.png')
+                        color_path = os.path.join(color_dir, f'{frame_idx:04d}.png')
                         cv2.imwrite(color_path, cv_image)
                     except Exception:
                         pass
                 if save_data['depth_img'] is not None:
                     try:
                         depth_image = self.bridge.imgmsg_to_cv2(save_data['depth_img'], 'passthrough')
-                        depth_path = os.path.join(demo_dir, 'depth', f'{frame_idx:04d}.png')
+                        depth_path = os.path.join(depth_dir, f'{frame_idx:04d}.png')
                         cv2.imwrite(depth_path, depth_image)
                     except Exception:
                         pass
@@ -338,12 +345,21 @@ class DemoRecorder(Node):
         if self.is_recording:
             self.get_logger().warn('Already recording!')
             return
-        self.demo_count += 1
-        demo_dir = f'demo_{self.demo_count:03d}'
+        max_idx = 0
+        for name in os.listdir(demo_base_dir):
+            if name.startswith('demo_') and name[5:8].isdigit():
+                idx = int(name[5:8])
+                if idx > max_idx:
+                    max_idx = idx
+        self.demo_count = max_idx + 1
+        demo_dir = f'{demo_base_dir}/demo_{self.demo_count:03d}'
         os.makedirs(demo_dir, exist_ok=True)
+        os.chmod(demo_dir, 0o777)
         # Create subdirectories for images
         os.makedirs(os.path.join(demo_dir, 'color'), exist_ok=True)
         os.makedirs(os.path.join(demo_dir, 'depth'), exist_ok=True)
+        os.chmod(os.path.join(demo_dir, 'color'), 0o777)
+        os.chmod(os.path.join(demo_dir, 'depth'), 0o777)
         self.demo_data = []
         self.is_recording = True
         # Reset velocity tracking
@@ -360,10 +376,12 @@ class DemoRecorder(Node):
             }
             with open(os.path.join(demo_dir, 'camera_intrinsics.json'), 'w') as f:
                 json.dump(intrinsics, f, indent=2)
+            os.chmod(os.path.join(demo_dir, 'camera_intrinsics.json'), 0o777)
         extrinsics = self.get_camera_extrinsics()
         if extrinsics is not None:
             with open(os.path.join(demo_dir, 'camera_extrinsics.json'), 'w') as f:
                 json.dump(extrinsics, f, indent=2)
+            os.chmod(os.path.join(demo_dir, 'camera_extrinsics.json'), 0o777)
         self.get_logger().info(f'Started recording demo {self.demo_count}')
         print(f"\n>>> RECORDING DEMO {self.demo_count} <<<\n")
 
@@ -372,9 +390,10 @@ class DemoRecorder(Node):
             self.get_logger().warn('Not recording!')
             return
         self.is_recording = False
-        demo_dir = f'demo_{self.demo_count:03d}'
+        demo_dir = f'{demo_base_dir}/demo_{self.demo_count:03d}'
         with open(os.path.join(demo_dir, 'trajectory.json'), 'w') as f:
             json.dump(self.demo_data, f, indent=2)
+        os.chmod(os.path.join(demo_dir, 'trajectory.json'), 0o777)
         self.get_logger().info(f'Stopped recording. Saved {len(self.demo_data)} frames to {demo_dir}/')
         print(f"\n>>> DEMO {self.demo_count} SAVED ({len(self.demo_data)} frames) <<<")
 

@@ -8,9 +8,11 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import Image, CameraInfo, JointState
 from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker, MarkerArray
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, JointConstraint, PositionConstraint, OrientationConstraint, BoundingVolume
 from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import ColorRGBA
 from tf2_ros import Buffer, TransformListener
 from cv_bridge import CvBridge
 from franka_msgs.action import Grasp, Move
@@ -97,6 +99,9 @@ class FOCINode(Node):
         
         # Running flag for clean shutdown
         self.running = True
+        
+        # Trajectory visualization publisher
+        self.trajectory_viz_pub = self.create_publisher(MarkerArray, '/foci_trajectory_viz', 10)
         
         self.get_logger().info('FOCI Node initialized, waiting for requests...')
         
@@ -252,8 +257,11 @@ class FOCINode(Node):
             trans = transform.transform.translation
             rot = transform.transform.rotation
             
+            # Convert quaternion to rotation matrix
             matrix = np.eye(4)
-            # Simple conversion (for full rotation matrix, use scipy or tf_transformations)
+            quat = [rot.x, rot.y, rot.z, rot.w]
+            rotation = Rotation.from_quat(quat)
+            matrix[:3, :3] = rotation.as_matrix()
             matrix[0, 3] = trans.x
             matrix[1, 3] = trans.y
             matrix[2, 3] = trans.z
@@ -333,6 +341,9 @@ class FOCINode(Node):
             
             self.get_logger().info(f'Executing trajectory with {len(poses)} waypoints')
             
+            # Visualize trajectory in RViz
+            self.visualize_trajectory(poses, mode)
+            
             # Execute each pose sequentially
             for i, pose_matrix in enumerate(poses):
                 # Convert 4x4 matrix to PoseStamped
@@ -360,20 +371,20 @@ class FOCINode(Node):
                 # Create MoveGroup goal
                 goal = MoveGroup.Goal()
                 goal.request.group_name = 'fr3_arm'
-                goal.request.num_planning_attempts = 5
-                goal.request.allowed_planning_time = 5.0
-                goal.request.max_velocity_scaling_factor = 0.3
-                goal.request.max_acceleration_scaling_factor = 0.3
+                goal.request.num_planning_attempts = 10
+                goal.request.allowed_planning_time = 10.0
+                goal.request.max_velocity_scaling_factor = 0.8
+                goal.request.max_acceleration_scaling_factor = 0.8
                 
                 # Set workspace parameters
                 goal.request.workspace_parameters.header.frame_id = 'fr3_link0'
                 goal.request.workspace_parameters.header.stamp = self.get_clock().now().to_msg()
                 goal.request.workspace_parameters.min_corner.x = -1.0
                 goal.request.workspace_parameters.min_corner.y = -1.0
-                goal.request.workspace_parameters.min_corner.z = -1.0
+                goal.request.workspace_parameters.min_corner.z = 0.0
                 goal.request.workspace_parameters.max_corner.x = 1.0
                 goal.request.workspace_parameters.max_corner.y = 1.0
-                goal.request.workspace_parameters.max_corner.z = 1.0
+                goal.request.workspace_parameters.max_corner.z = 2.0
                 
                 # Planning options
                 goal.planning_options.plan_only = False
@@ -391,7 +402,7 @@ class FOCINode(Node):
                 # Create a small sphere around the target position
                 region = SolidPrimitive()
                 region.type = SolidPrimitive.SPHERE
-                region.dimensions = [0.0001]  # Very small tolerance
+                region.dimensions = [0.02]  # 2cm tolerance
                 position_constraint.constraint_region.primitives.append(region)
                 position_constraint.constraint_region.primitive_poses.append(pose_stamped.pose)
                 position_constraint.weight = 1.0
@@ -401,9 +412,9 @@ class FOCINode(Node):
                 orientation_constraint.header.frame_id = 'fr3_link0'
                 orientation_constraint.link_name = 'fr3_hand_tcp'
                 orientation_constraint.orientation = pose_stamped.pose.orientation
-                orientation_constraint.absolute_x_axis_tolerance = 0.001
-                orientation_constraint.absolute_y_axis_tolerance = 0.001
-                orientation_constraint.absolute_z_axis_tolerance = 0.001
+                orientation_constraint.absolute_x_axis_tolerance = 0.1
+                orientation_constraint.absolute_y_axis_tolerance = 0.1
+                orientation_constraint.absolute_z_axis_tolerance = 0.1
                 orientation_constraint.weight = 1.0
                 
                 goal.request.goal_constraints[0].position_constraints.append(position_constraint)
@@ -475,6 +486,84 @@ class FOCINode(Node):
         quat_xyzw = rotation.as_quat()  # Returns [x, y, z, w]
         return quat_xyzw.tolist()
     
+    def visualize_trajectory(self, poses, mode='grasp'):
+        """Visualize trajectory in RViz using MarkerArray"""
+        try:
+            marker_array = MarkerArray()
+            
+            # Color based on mode
+            if mode == 'grasp':
+                color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.8)  # Orange
+            else:
+                color = ColorRGBA(r=0.0, g=0.8, b=1.0, a=0.8)  # Cyan
+            
+            # Add sphere markers for waypoints
+            for i, pose_matrix in enumerate(poses):
+                marker = Marker()
+                marker.header.frame_id = 'fr3_link0'
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = f'trajectory_{mode}'
+                marker.id = i
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
+                marker.lifetime = rclpy.duration.Duration(seconds=0).to_msg()
+                
+                # Position from matrix
+                marker.pose.position.x = float(pose_matrix[0][3])
+                marker.pose.position.y = float(pose_matrix[1][3])
+                marker.pose.position.z = float(pose_matrix[2][3])
+                
+                # Orientation from matrix
+                R = np.array([
+                    [pose_matrix[0][0], pose_matrix[0][1], pose_matrix[0][2]],
+                    [pose_matrix[1][0], pose_matrix[1][1], pose_matrix[1][2]],
+                    [pose_matrix[2][0], pose_matrix[2][1], pose_matrix[2][2]]
+                ])
+                quat = self._rotation_matrix_to_quaternion(R)
+                marker.pose.orientation.x = quat[0]
+                marker.pose.orientation.y = quat[1]
+                marker.pose.orientation.z = quat[2]
+                marker.pose.orientation.w = quat[3]
+                
+                # Size and color
+                marker.scale.x = 0.02
+                marker.scale.y = 0.02
+                marker.scale.z = 0.02
+                marker.color = color
+                
+                marker_array.markers.append(marker)
+            
+            # Add line strip connecting waypoints
+            if len(poses) > 1:
+                line_marker = Marker()
+                line_marker.header.frame_id = 'fr3_link0'
+                line_marker.header.stamp = self.get_clock().now().to_msg()
+                line_marker.ns = f'trajectory_{mode}_line'
+                line_marker.id = 0
+                line_marker.type = Marker.LINE_STRIP
+                line_marker.action = Marker.ADD
+                line_marker.lifetime = rclpy.duration.Duration(seconds=0).to_msg()
+                
+                for pose_matrix in poses:
+                    from geometry_msgs.msg import Point
+                    p = Point()
+                    p.x = float(pose_matrix[0][3])
+                    p.y = float(pose_matrix[1][3])
+                    p.z = float(pose_matrix[2][3])
+                    line_marker.points.append(p)
+                
+                line_marker.scale.x = 0.005  # Line width
+                line_marker.color = color
+                
+                marker_array.markers.append(line_marker)
+            
+            # Publish markers
+            self.trajectory_viz_pub.publish(marker_array)
+            self.get_logger().info(f'Published {len(poses)} trajectory waypoints to RViz')
+            
+        except Exception as e:
+            self.get_logger().warn(f'Failed to visualize trajectory: {e}')
+    
     def open_gripper(self):
         """Open gripper"""
         goal = Move.Goal()
@@ -507,9 +596,8 @@ class FOCINode(Node):
                     response = self.get_observation()
                     
                 elif request_type == 'execute_trajectory':
-                    trajectory = request.get('trajectory', {})
                     mode = request.get('mode', 'grasp')
-                    response = self.execute_trajectory(trajectory, mode)
+                    response = self.execute_trajectory(request, mode)
                     
                 elif request_type == 'open_gripper':
                     self.open_gripper()
@@ -518,6 +606,13 @@ class FOCINode(Node):
                 elif request_type == 'close_gripper':
                     self.close_gripper()
                     response = {'status': 'success', 'message': 'Gripper closed'}
+                    
+                elif request_type == 'reset_robot':
+                    success = self.reset_robot()
+                    if success:
+                        response = {'status': 'success', 'message': 'Robot reset to home position'}
+                    else:
+                        response = {'status': 'failed', 'message': 'Failed to reset robot'}
                     
                 else:
                     response = {'status': 'failed', 'message': f'Unknown request type: {request_type}'}
