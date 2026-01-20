@@ -8,12 +8,15 @@ endif()
 # Find dependencies
 find_package(ament_cmake REQUIRED)
 
-# Install Python scripts
 install(PROGRAMS
   scripts/foci_node.py
-  scripts/foci_policy_test.py
-  scripts/foci_policy_realworld.py
+  motion_planning/panda_control_velocity.py
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY motion_planning/
+  DESTINATION lib/${PROJECT_NAME}/motion_planning
+  USE_SOURCE_PERMISSIONS
 )
 
 # Install launch files

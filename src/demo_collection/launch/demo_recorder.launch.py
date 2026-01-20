@@ -40,8 +40,8 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='static_tf_fr3_to_ref',
         arguments=[
-            '0.735097', '0.646207', '0.664998',
-            '-0.370981', '-0.863263', '0.320188', '0.120952',
+            '0.749022', '0.656649', '0.659689',
+            '-0.382599', '-0.868189', '0.293314', '0.117616',
             'fr3_link0', 'ref_frame'
         ]
     )
