@@ -53,6 +53,7 @@ class FOCINode(Node):
         self.latest_depth = None
         self.latest_camera_info = None
         self.latest_gripper_width = 0.0
+        self.cached_point_cloud = None
         
         # ROS2 subscribers
         self.color_sub = self.create_subscription(Image, '/camera/color/image_raw', self.color_callback, 10)
@@ -119,6 +120,36 @@ class FOCINode(Node):
             self.get_logger().warn(f'Failed to get transform {target_frame}->{source_frame}: {e}')
             return None
 
+    def depth_to_point_cloud(self, depth, K, cam_extrinsic, mask=None):
+        """ Convert depth image to point cloud, optionally filtering by mask """
+        depth = depth.astype(np.float32)
+        depth_filtered = cv2.bilateralFilter(depth, d=5, sigmaColor=10, sigmaSpace=10)
+        depth = depth_filtered.astype(np.float32) / 1000.0  # mm to meters
+        h, w = depth.shape
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        v, u = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+        # Filter valid depth points
+        if mask is not None:
+            valid = (mask > 0) & (depth > 0.01) & (depth < 3.0)
+        else:
+            valid = (depth > 0.01) & (depth < 3.0)
+        u_valid = u[valid]
+        v_valid = v[valid]
+        z_valid = depth[valid]
+        # Back-project to 3D
+        x = (u_valid - cx) * z_valid / fx
+        y = (v_valid - cy) * z_valid / fy
+        z = z_valid
+        point_cloud = np.stack([x, y, z], axis=1)
+        point_cloud_world = (cam_extrinsic[:3, :3] @ point_cloud.T).T + cam_extrinsic[:3, 3]
+        point_cloud_world_without_table = point_cloud_world[point_cloud_world[:, 2] > 0.04]
+        max_points = 2048
+        if point_cloud_world_without_table.shape[0] > max_points:
+            idx = np.random.choice(point_cloud_world_without_table.shape[0], max_points, replace=False)
+            point_cloud_world_without_table = point_cloud_world_without_table[idx]
+        return point_cloud_world_without_table
+    
     def get_observation(self):
         """Collect current observation for FOCI policy"""
         # Wait for data if not available
@@ -173,11 +204,49 @@ class FOCINode(Node):
                 self.get_logger().warn('Received empty trajectory')
                 return {'status': 'failed', 'message': 'Empty trajectory'}
             self.get_logger().info(f'Executing trajectory with {len(poses)} waypoints')
-            self.visualize_trajectory(poses, mode)
 
-             # 1. Plan to the first pose
+            # 0. Direct motion without obstacle avoidance
+            if mode == "lift":
+                first_pose_mat = Transform.from_matrix(np.array(poses[0]))
+                success = self.pc.goto_pose(first_pose_mat)
+                if not success:
+                    self.get_logger().error('Failed to reach first waypoint')
+                    return {'status': 'failed', 'message': 'Failed to reach first waypoint'}
+                else:
+                    self.get_logger().info('Reached first waypoint successfully')
+                time.sleep(0.5)
+                return {'status': 'success', 'message': 'Trajectory executed successfully'}
+
+            self.visualize_trajectory(poses, mode)
+            # Generate point cloud from current observation
+            if self.latest_depth is None or self.latest_camera_info is None:
+                self.get_logger().warn('No depth or camera info available for point cloud')
+                point_cloud = None
+            elif self.cached_point_cloud is not None:
+                self.get_logger().info('Using cached point cloud for trajectory execution')
+                point_cloud = self.cached_point_cloud
+            # obstacle avoidance only enabled for grasp_oa and manip_oa mode
+            elif mode in ['grasp', 'manip']:
+                point_cloud = None
+            else:
+                self.get_logger().info('Generating point cloud for trajectory execution')
+                try:
+                    depth = self.bridge.imgmsg_to_cv2(self.latest_depth, 'passthrough')
+                    K = np.array(self.latest_camera_info.k).reshape(3, 3)
+                    # Transform to robot base frame (fr3_link0)
+                    cam_extrinsic = self.get_transform('fr3_link0', 'camera_color_optical_frame')
+                    cam_extrinsic = np.array(cam_extrinsic['matrix'])
+                    # Convert depth to point cloud (in world frame)
+                    point_cloud = self.depth_to_point_cloud(depth, K, cam_extrinsic)
+                    self.cached_point_cloud = point_cloud
+                    self.get_logger().info(f'Generated point cloud with {point_cloud.shape[0]} points')
+                except Exception as e:
+                    self.get_logger().error(f'Failed to generate point cloud: {e}')
+                    point_cloud = None
+
+            # 1. Plan to the first pose
             first_pose_mat = Transform.from_matrix(np.array(poses[0]))
-            success = self.pc.goto_pose(first_pose_mat)
+            success = self.pc.goto_pose(first_pose_mat, pcl=point_cloud)
             if not success:
                 self.get_logger().error('Failed to reach first waypoint')
                 return {'status': 'failed', 'message': 'Failed to reach first waypoint'}
@@ -200,7 +269,8 @@ class FOCINode(Node):
         except Exception as e:
             self.get_logger().error(f'Trajectory execution exception: {e}')
             return {'status': 'failed', 'message': f'Exception occurred: {str(e)}'}
-    
+
+
     def open_gripper(self):
         """Open gripper"""
         goal = Move.Goal()
@@ -217,7 +287,7 @@ class FOCINode(Node):
         # goal.epsilon.inner = 0.005
         # goal.epsilon.outer = 0.005
         # self.franka_grasp_client.send_goal_async(goal)
-        success = self.pc.grasp(width=0.01, force=30.0, speed=0.05)
+        success = self.pc.grasp(width=0.01, force=50.0, speed=0.05)
         if not success:
             return {'status': 'failed', 'message': 'Failed to grasp the object'}
         return {'status': 'success', 'message': 'Grasp executed successfully'}
@@ -234,10 +304,12 @@ class FOCINode(Node):
         try:
             marker_array = MarkerArray()
             # Color based on mode
-            if mode == 'grasp':
+            if mode in ['grasp', 'grasp_oa']:
                 color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.8)  # Orange
-            else:
+            elif mode in ['manip', 'manip_oa']:
                 color = ColorRGBA(r=0.0, g=0.8, b=1.0, a=0.8)  # Cyan
+            else:
+                return
             
             # Add sphere markers for waypoints
             for i, pose_matrix in enumerate(poses):

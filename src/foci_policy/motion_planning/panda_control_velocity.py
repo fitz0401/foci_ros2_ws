@@ -111,12 +111,13 @@ class PandaCommander(Node):
             f'{robot_name}_joint1', f'{robot_name}_joint2', f'{robot_name}_joint3', 
             f'{robot_name}_joint4', f'{robot_name}_joint5', f'{robot_name}_joint6', 
             f'{robot_name}_joint7'
-        ]
+        ]     
         
-        # TODO: define TCP transform if needed
-        self.T_body_tcp = Transform.from_dict({"rotation": [0.0, 0.0, 0.0, 1.0], "translation": [0.0, 0.0, 0.0]})
+        self.T_body_tcp = Transform.from_dict({"rotation": [0.0, 0.0, 0.0, 1.0], "translation": [0.0, 0.0, -0.05]})
         self.T_tcp_body = self.T_body_tcp.inverse()
         self.T_tcp_link8 = self.T_body_tcp # Alias
+        # TODO: define TCP transform if needed
+        self.T_offset = Transform.from_dict({"rotation": [0.0, 0.0, 0.0, 1.0], "translation": [0.0, 0.0, -0.05]})
 
         # wrench 
         self.wrench_raw = np.zeros(6)
@@ -124,9 +125,9 @@ class PandaCommander(Node):
         self.wrench_filtered = np.zeros(6)
         self.baseline_samples = []
         self.baseline_ready = False
-        self.baseline_sample_count = 100        # 前100帧用于基线估计
-        self.ema_alpha = 0.02                   # 低通滤波系数（慢）
-        self.contact_hysteresis_count = 3       # 连续帧数确认接触
+        self.baseline_sample_count = 100        # First 100 frames for baseline estimation
+        self.ema_alpha = 0.02                   # Low-pass filter coefficient (slow)
+        self.contact_hysteresis_count = 3       # Consecutive frames to confirm contact
         self._contact_count = 0
         
         # --- ROS Subs/Pubs ---
@@ -201,7 +202,7 @@ class PandaCommander(Node):
 
         request = SetForceTorqueCollisionBehavior.Request()
 
-        # ========= 设置较高的阈值（常用配置） =========
+        # ========= Set higher thresholds (common configuration) =========
         # request.lower_torque_thresholds_acc  = [30, 30, 30, 20, 20, 15, 10]
         # request.upper_torque_thresholds_acc  = [45, 45, 45, 35, 35, 25, 20]
 
@@ -384,40 +385,9 @@ class PandaCommander(Node):
 
     
     def goto_joints(self, target_joints):
-        arrived = False
         current_joints = np.array(self.get_current_joint_position())
-        error = target_joints - current_joints
-        self.react_control_flag = True
-        last_velocity = np.array([0.0]*7)
-        last_error = error 
-
-        if np.linalg.norm(error) < self.goal_tolerance:
-            self.react_control_flag = False
-            return True
-            
-        while np.linalg.norm(error) > self.goal_tolerance and (self.robot_error is False):
-            loop_start = time.time()
-            robot_state_joint = self.get_current_joint_position()
-            error = target_joints - np.array(robot_state_joint)
-            error_derivative = (error - last_error) / self.dt
-            raw_joint_vel = (self.kp * error) + (self.kd * error_derivative)
-            
-            joint_acc = (raw_joint_vel - last_velocity) / self.dt
-            if (np.abs(joint_acc) > self.limit_acc).any():
-                joint_acc = np.clip(joint_acc, -self.limit_acc, self.limit_acc)
-                joint_vel = last_velocity + joint_acc * self.dt
-            else:
-                joint_vel = np.clip(raw_joint_vel, -self.limit_vel, self.limit_vel)
-            
-            last_velocity = joint_vel
-            last_error = error
-            self.joint_command_msg.name = self.joint_names
-            self.joint_command_msg.velocity = joint_vel.tolist()
-            elapsed = time.time() - loop_start
-            if self.dt > elapsed:
-                time.sleep(self.dt - elapsed)
-        self.react_control_flag = False
-        return True
+        interpotaled_traj = rtb.jtraj(current_joints, target_joints, 20)
+        return self.goto_joint_trajectory(interpotaled_traj.q)
 
 
     def goto_pose(self, target_pose: Transform, pcl=None, plan_config=None) -> bool:
@@ -428,7 +398,7 @@ class PandaCommander(Node):
             return True
         
         self.get_logger().info(f"Planning to target pose...")
-        joint_waypoints = self.planning(target_pose, pcl=pcl, plan_config=plan_config)
+        joint_waypoints = self.planning(target_pose * self.T_offset, pcl=pcl, plan_config=plan_config)
         if joint_waypoints is None:
             self.get_logger().error("Planning failed.")
             return False
@@ -437,7 +407,7 @@ class PandaCommander(Node):
 
 
     def goto_pose_reactive(self, target_pose, Gain=1, Lambda=0.1, threshold=0.001, detect_force=True, pcl=None, watch_dog_limit=70):
-        target_pose = target_pose * self.T_tcp_body
+        target_pose = target_pose * self.T_tcp_body * self.T_offset
         self.react_control_flag = True
         arrived = False
         watch_dog = 0
