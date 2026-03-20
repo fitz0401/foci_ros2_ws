@@ -11,7 +11,6 @@ from curobo.types.math import Pose
 from curobo.types.robot import JointState
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
 from curobo.geom.types import WorldConfig, Mesh, Cuboid
-from utils_exp.vis import color_print
 
 class MotionPlanner:
     def __init__(self, robot_yml="ur5e.yml", debug=True):

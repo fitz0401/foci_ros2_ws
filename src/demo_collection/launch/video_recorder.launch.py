@@ -1,22 +1,16 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription
+from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 import os
 
 
 def generate_launch_description():
-    gripper_arg = DeclareLaunchArgument(
-        'gripper',
-        default_value='franka',
-        description='Gripper type: franka or robotiq'
-    )
-    gripper = LaunchConfiguration('gripper')
+    # Suppress RealSense warnings
+    suppress_realsense_warnings = SetEnvironmentVariable('LRS_LOG_LEVEL', 'error')
+    suppress_usb_warnings = SetEnvironmentVariable('LIBUSB_LOG_LEVEL', '1')
 
-    # Joy node for joystick input
     joy_node = Node(
         package='joy',
         executable='joy_node',
@@ -24,7 +18,6 @@ def generate_launch_description():
         output='screen',
     )
 
-    # RealSense Camera
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             os.path.join(
@@ -43,7 +36,6 @@ def generate_launch_description():
         }.items()
     )
 
-    # TF: fr3_link0 → ref_frame
     tf_fr3_to_ref = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
@@ -55,7 +47,6 @@ def generate_launch_description():
         ]
     )
 
-    # TF: ref_frame → camera_link
     tf_ref_to_cam = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
@@ -65,6 +56,20 @@ def generate_launch_description():
             '0.49272', '-0.49219', '0.50886', '0.50601',
             'ref_frame', 'camera_link'
         ]
+    )
+
+    video_recorder = Node(
+        package='demo_collection',
+        executable='video_recorder.py',
+        name='video_recorder',
+        output='screen',
+    )
+
+    joystick_publisher = Node(
+        package='demo_collection',
+        executable='joystick_publisher.py',
+        name='joystick_publisher',
+        output='screen',
     )
 
     # RViz
@@ -79,40 +84,14 @@ def generate_launch_description():
         output='screen'
     )
 
-    # Demo Recorder
-    demo_recorder = Node(
-        package='demo_collection',
-        executable='demo_recorder.py',
-        name='demo_recorder',
-        parameters=[{'gripper': gripper}],
-        output='screen',
-    )
-
-    # Keyboard Publisher (in separate terminal)
-    keyboard_publisher = Node(
-        package='demo_collection',
-        executable='keyboard_publisher.py',
-        name='keyboard_publisher',
-        output='screen',
-        prefix='xterm -e',  # Run in separate terminal window for keyboard input
-    )
-
-    # Joystick Publisher (optional - comment out if no joystick)
-    joystick_publisher = Node(
-        package='demo_collection',
-        executable='joystick_publisher.py',
-        name='joystick_publisher',
-        output='screen',
-    )
-
     return LaunchDescription([
-        gripper_arg,
+        suppress_realsense_warnings,
+        suppress_usb_warnings,
         joy_node,
+        rviz_node,
         tf_fr3_to_ref,
         tf_ref_to_cam,
         realsense_launch,
-        rviz_node,
-        demo_recorder,
-        keyboard_publisher,
-        joystick_publisher,  # Comment this line if no joystick available
+        video_recorder,
+        joystick_publisher,
     ])

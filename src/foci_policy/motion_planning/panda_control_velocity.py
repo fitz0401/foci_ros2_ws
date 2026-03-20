@@ -132,7 +132,8 @@ class PandaCommander(Node):
         
         # --- ROS Subs/Pubs ---
         self.joint_state_sub = self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 1, callback_group=self.callback_group)
-        self.joint_velo_pub = self.create_publisher(JointState, '/joint_velocity_controller/joint_velocity', 1, callback_group=self.callback_group)
+        # self.joint_velo_pub = self.create_publisher(JointState, '/joint_velocity_controller/joint_velocity', 1, callback_group=self.callback_group)
+        self.joint_velo_pub = self.create_publisher(JointState, '/joint_impedance_controller/joint_velocity', 1, callback_group=self.callback_group)
         self.predicted_path_pub = self.create_publisher(Path, '/planned_trajectory', 1, callback_group=self.callback_group)
         self.force_sub = self.create_subscription(FrankaRobotState, "/franka_robot_state_broadcaster/robot_state", self.force_callback, 10, callback_group=self.callback_group)
         self.robot_state_sub = self.create_subscription(FrankaRobotState, '/franka_robot_state_broadcaster/robot_state', self.robot_state_cb, 10, callback_group=self.callback_group)

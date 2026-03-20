@@ -17,6 +17,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient
 from franka_msgs.action import Grasp, Move
+from control_msgs.action import GripperCommand
 from sensor_msgs.msg import Image, CameraInfo, JointState
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
@@ -33,6 +34,19 @@ class FOCINode(Node):
     """ROS2 node that bridges between FOCI policy and Franka robot using cuMotion"""
     def __init__(self):
         super().__init__('foci_node')
+        self.gripper_type = self.declare_parameter('gripper', 'franka').value.lower().strip()
+        if self.gripper_type not in ('franka', 'robotiq'):
+            self.get_logger().warn(
+                f"Unknown gripper type '{self.gripper_type}', fallback to 'franka'"
+            )
+            self.gripper_type = 'franka'
+        self.robotiq_joint_name = 'robotiq_85_left_knuckle_joint'
+        self.robotiq_open_position = 0.0
+        self.robotiq_closed_position = 0.8
+        self.robotiq_joint_position = 0.0
+        self._robotiq_joint_warned = False
+        self._robotiq_goal_in_flight = False
+        self.gripper_open_width = 0.08
 
         # ZMQ server setup (REP pattern - respond to requests)
         self.zmq_context = zmq.Context()
@@ -40,6 +54,7 @@ class FOCINode(Node):
         self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
         self.socket.bind("tcp://*:5555")
         self.get_logger().info('ZMQ server listening on port 5555')
+        self.get_logger().info(f'Using gripper type: {self.gripper_type}')
         
         # CV Bridge for image conversion
         self.bridge = CvBridge()
@@ -59,11 +74,22 @@ class FOCINode(Node):
         self.color_sub = self.create_subscription(Image, '/camera/color/image_raw', self.color_callback, 10)
         self.depth_sub = self.create_subscription(Image, '/camera/aligned_depth_to_color/image_raw', self.depth_callback, 10)
         self.camera_info_sub = self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10) 
-        self.gripper_state_sub = self.create_subscription(JointState, '/fr3_gripper/joint_states', self.gripper_state_callback, 10)
+        gripper_joint_topic = '/robotiq/joint_states' if self.gripper_type == 'robotiq' else '/fr3_gripper/joint_states'
+        self.gripper_state_sub = self.create_subscription(JointState, gripper_joint_topic, self.gripper_state_callback, 10)
         
         # Gripper action clients
-        self.franka_grasp_client = ActionClient(self, Grasp, '/fr3_gripper/grasp')
-        self.franka_move_client = ActionClient(self, Move, '/fr3_gripper/move')
+        self.franka_grasp_client = None
+        self.franka_move_client = None
+        self.robotiq_gripper_client = None
+        if self.gripper_type == 'robotiq':
+            self.robotiq_gripper_client = ActionClient(
+                self,
+                GripperCommand,
+                '/robotiq/robotiq_gripper_controller/gripper_cmd'
+            )
+        else:
+            self.franka_grasp_client = ActionClient(self, Grasp, '/fr3_gripper/grasp')
+            self.franka_move_client = ActionClient(self, Move, '/fr3_gripper/move')
         
         # Running flag for clean shutdown
         self.running = True
@@ -88,8 +114,23 @@ class FOCINode(Node):
         self.latest_camera_info = msg
     
     def gripper_state_callback(self, msg):
-        if len(msg.position) >= 2:
-            self.latest_gripper_width = msg.position[0] + msg.position[1]
+        if len(msg.position) == 0:
+            return
+
+        if self.gripper_type == 'robotiq':
+            try:
+                idx = msg.name.index(self.robotiq_joint_name)
+                self.robotiq_joint_position = float(msg.position[idx])
+                self.latest_gripper_width = self.robotiq_joint_position
+                self._robotiq_joint_warned = False
+            except ValueError:
+                if not self._robotiq_joint_warned:
+                    self.get_logger().warn(
+                        f"Joint '{self.robotiq_joint_name}' not found in /robotiq/joint_states"
+                    )
+                    self._robotiq_joint_warned = True
+        else:
+            self.latest_gripper_width = sum(msg.position)
     
     def get_transform(self, target_frame, source_frame):
         """Get transform from TF tree"""
@@ -184,7 +225,11 @@ class FOCINode(Node):
         if gripper_pose is None:
             return {'status': 'failed', 'message': 'Failed to get gripper pose'}
         # Calculate gripper open ratio (0=closed, 1=open)
-        gripper_open = min(self.latest_gripper_width / 0.08, 1.0)
+        if self.gripper_type == 'robotiq':
+            close_ratio = min(max(self.robotiq_joint_position / self.robotiq_closed_position, 0.0), 1.0)
+            gripper_open = 1.0 - close_ratio
+        else:
+            gripper_open = min(self.latest_gripper_width / self.gripper_open_width, 1.0)
         return {
             'status': 'success',
             'data': {
@@ -273,6 +318,14 @@ class FOCINode(Node):
 
     def open_gripper(self):
         """Open gripper"""
+        if self.gripper_type == 'robotiq':
+            ok = self.move_robotiq_gripper(self.robotiq_open_position, max_effort=50.0, timeout=5.0)
+            if not ok:
+                return {'status': 'failed', 'message': 'Failed to open Robotiq gripper'}
+            return {'status': 'success', 'message': 'Robotiq gripper opened successfully'}
+
+        if self.franka_move_client is None:
+            return {'status': 'failed', 'message': 'Franka move client is not initialized'}
         goal = Move.Goal()
         goal.width = 0.08
         goal.speed = 0.1
@@ -280,6 +333,12 @@ class FOCINode(Node):
         return {'status': 'success', 'message': 'Gripper opened successfully'}
     
     def close_gripper(self):
+        if self.gripper_type == 'robotiq':
+            ok = self.move_robotiq_gripper(self.robotiq_closed_position, max_effort=50.0, timeout=5.0)
+            if not ok:
+                return {'status': 'failed', 'message': 'Failed to close Robotiq gripper'}
+            return {'status': 'success', 'message': 'Robotiq gripper closed successfully'}
+
         # goal = Grasp.Goal()
         # goal.width = 0.0
         # goal.speed = 0.1
@@ -291,6 +350,60 @@ class FOCINode(Node):
         if not success:
             return {'status': 'failed', 'message': 'Failed to grasp the object'}
         return {'status': 'success', 'message': 'Grasp executed successfully'}
+
+    def move_robotiq_gripper(self, position: float, max_effort: float = 50.0, timeout: float = 5.0) -> bool:
+        if self.robotiq_gripper_client is None:
+            self.get_logger().warn('Robotiq client is not initialized')
+            return False
+
+        if self._robotiq_goal_in_flight:
+            self.get_logger().info('Robotiq gripper is moving, command ignored')
+            return False
+
+        if not self.robotiq_gripper_client.wait_for_server(timeout_sec=timeout):
+            self.get_logger().warn(f'Robotiq action server not available within {timeout:.1f}s')
+            return False
+
+        goal = GripperCommand.Goal()
+        goal.command.position = float(position)
+        goal.command.max_effort = float(max_effort)
+
+        send_future = self.robotiq_gripper_client.send_goal_async(goal)
+        self._robotiq_goal_in_flight = True
+
+        def _goal_response_cb(fut):
+            try:
+                goal_handle = fut.result()
+            except Exception as exc:
+                self._robotiq_goal_in_flight = False
+                self.get_logger().warn(f'Robotiq goal request failed: {exc}')
+                return
+
+            if not goal_handle or not goal_handle.accepted:
+                self._robotiq_goal_in_flight = False
+                self.get_logger().warn('Robotiq goal rejected by action server')
+                return
+
+            def _result_cb(result_future):
+                self._robotiq_goal_in_flight = False
+                try:
+                    result_msg = result_future.result()
+                    if result_msg is None:
+                        self.get_logger().warn('Robotiq result is None')
+                        return
+                    result = result_msg.result
+                    self.get_logger().info(
+                        f'Robotiq result: reached_goal={result.reached_goal}, '
+                        f'stalled={result.stalled}, effort={result.effort:.3f}, '
+                        f'position={result.position:.3f}, status={result_msg.status}'
+                    )
+                except Exception as exc:
+                    self.get_logger().warn(f'Robotiq result error: {exc}')
+
+            goal_handle.get_result_async().add_done_callback(_result_cb)
+
+        send_future.add_done_callback(_goal_response_cb)
+        return True
 
     def reset_robot(self):
         success = self.pc.home()

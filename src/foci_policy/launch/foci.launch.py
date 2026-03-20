@@ -1,13 +1,21 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 import os
 
 
 def generate_launch_description():
+    gripper_arg = DeclareLaunchArgument(
+        'gripper',
+        default_value='franka',
+        description='Gripper type: franka or robotiq'
+    )
+    gripper = LaunchConfiguration('gripper')
+
     # Suppress RealSense warnings
     suppress_realsense_warnings = SetEnvironmentVariable('LRS_LOG_LEVEL', 'error')
     suppress_usb_warnings = SetEnvironmentVariable('LIBUSB_LOG_LEVEL', '1')
@@ -56,32 +64,38 @@ def generate_launch_description():
         ]
     )
 
-    # RViz
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        arguments=['-d', os.path.join(
-            FindPackageShare('demo_collection').find('demo_collection'),
-            'config', 'fr3_rviz_config.rviz'
-        )],
-        output='screen'
+    # RViz for visualization
+    rviz_config_path = os.path.join(
+        FindPackageShare('demo_collection').find('demo_collection'),
+        'config', 'fr3_rviz_config.rviz'
     )
+    
+    # Check if rviz config exists, otherwise skip
+    rviz_nodes = []
+    if os.path.exists(rviz_config_path):
+        rviz_nodes.append(Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            arguments=['-d', rviz_config_path],
+            output='screen'
+        ))
 
-    # FOCI Node
+    # FOCI Node (ZMQ bridge with PandaCommander)
     foci_node = Node(
         package='foci_policy',
         executable='foci_node.py',
         name='foci_node',
+        parameters=[{'gripper': gripper}],
         output='screen',
     )
 
     return LaunchDescription([
+        gripper_arg,
         suppress_realsense_warnings,
         suppress_usb_warnings,
         tf_fr3_to_ref,
         tf_ref_to_cam,
         realsense_launch,
         foci_node,
-        rviz_node,
-    ])
+    ] + rviz_nodes)

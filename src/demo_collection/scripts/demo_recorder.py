@@ -12,12 +12,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from franka_msgs.action import Grasp, Move
+from control_msgs.action import GripperCommand
 from sensor_msgs.msg import Image, CameraInfo, JointState
 from std_msgs.msg import String
-from controller_manager_msgs.srv import ListControllers, SwitchController
 from tf2_ros import Buffer, TransformListener
 import threading
-import subprocess
 import json
 import os
 import cv2
@@ -32,9 +31,36 @@ os.makedirs(demo_base_dir, exist_ok=True)
 class DemoRecorder(Node):
     def __init__(self):
         super().__init__('demo_recorder')
+        self.gripper_type = self.declare_parameter('gripper', 'franka').value.lower().strip()
+        if self.gripper_type not in ('franka', 'robotiq'):
+            self.get_logger().warn(
+                f"Unknown gripper type '{self.gripper_type}', fallback to 'franka'"
+            )
+            self.gripper_type = 'franka'
+        self.robotiq_joint_name = 'robotiq_85_left_knuckle_joint'
+        self.robotiq_open_position = 0.0
+        self.robotiq_closed_position = 0.8
+        self.robotiq_toggle_threshold = 0.05
+        self.robotiq_joint_position = 0.0
+        self._robotiq_joint_warned = False
+        self._robotiq_goal_in_flight = False
+
         # Gripper action clients
-        self.franka_grasp_client = ActionClient(self, Grasp, '/fr3_gripper/grasp')
-        self.franka_move_client = ActionClient(self, Move, '/fr3_gripper/move')
+        self.franka_grasp_client = None
+        self.franka_move_client = None
+        self.robotiq_gripper_client = None
+        if self.gripper_type == 'robotiq':
+            self.robotiq_gripper_client = ActionClient(
+                self,
+                GripperCommand,
+                '/robotiq/robotiq_gripper_controller/gripper_cmd'
+            )
+            gripper_joint_topic = '/robotiq/joint_states'
+        else:
+            self.franka_grasp_client = ActionClient(self, Grasp, '/fr3_gripper/grasp')
+            self.franka_move_client = ActionClient(self, Move, '/fr3_gripper/move')
+            gripper_joint_topic = '/fr3_gripper/joint_states'
+
         # TF buffer for getting end-effector pose
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -44,7 +70,7 @@ class DemoRecorder(Node):
         self.color_sub = self.create_subscription(Image, '/camera/color/image_raw', self.color_callback, 10)
         self.depth_sub = self.create_subscription(Image, '/camera/aligned_depth_to_color/image_raw', self.depth_callback, 10)
         self.camera_info_sub = self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
-        self.gripper_state_sub = self.create_subscription(JointState, '/fr3_gripper/joint_states', self.gripper_state_callback, 10)
+        self.gripper_state_sub = self.create_subscription(JointState, gripper_joint_topic, self.gripper_state_callback, 10)
         self.command_sub = self.create_subscription(String, '/demo_commands', self.command_callback, 10)
         # Data storage
         self.latest_color = None
@@ -67,12 +93,6 @@ class DemoRecorder(Node):
         self.save_thread.start()
         # Recording timer (5 Hz)
         self.record_timer = self.create_timer(0.2, self.record_frame)
-        # Controller monitoring timer (1 Hz)
-        self.controller_check_timer = self.create_timer(1.0, self.check_controller_status)
-        self.impedance_controller_name = 'joint_impedance_example_controller'
-        self.controller_restarting = False
-        # Controller manager service clients
-        self.list_controllers_client = self.create_client(ListControllers, '/controller_manager/list_controllers')
         # Gripper homing (non-blocking)
         self.gripper_ready = False
         threading.Thread(target=self._init_gripper, daemon=True).start()
@@ -80,17 +100,24 @@ class DemoRecorder(Node):
 
     def _init_gripper(self):
         """Initialize gripper by opening it"""
+        if self.gripper_type == 'robotiq':
+            if self.move_robotiq_gripper(self.robotiq_open_position, max_effort=50.0, timeout=5.0):
+                self.gripper_ready = True
+                print("Robotiq gripper initialized and opened")
+            return
+
         if self.franka_move_client.wait_for_server(timeout_sec=5.0):
             goal = Move.Goal()
             goal.width = 0.08
             goal.speed = 0.1
             self.franka_move_client.send_goal_async(goal)
             self.gripper_ready = True
-            print("Gripper initialized and opened")
+            print("Franka gripper initialized and opened")
 
     def print_instructions(self):
         print("\n" + "="*60)
         print("DEMO RECORDING SYSTEM")
+        print(f"Gripper type: {self.gripper_type}")
         print("="*60)
         print("Listening to /demo_commands topic for:")
         print("  'g' - Toggle gripper (open/close)")
@@ -109,7 +136,22 @@ class DemoRecorder(Node):
         self.latest_camera_info = msg
 
     def gripper_state_callback(self, msg):
-        if len(msg.position) > 0:
+        if len(msg.position) == 0:
+            return
+
+        if self.gripper_type == 'robotiq':
+            try:
+                idx = msg.name.index(self.robotiq_joint_name)
+                self.robotiq_joint_position = float(msg.position[idx])
+                self.latest_gripper_width = self.robotiq_joint_position
+                self._robotiq_joint_warned = False
+            except ValueError:
+                if not self._robotiq_joint_warned:
+                    self.get_logger().warn(
+                        f"Joint '{self.robotiq_joint_name}' not found in /robotiq/joint_states"
+                    )
+                    self._robotiq_joint_warned = True
+        else:
             self.latest_gripper_width = sum(msg.position)
 
     def command_callback(self, msg):
@@ -211,8 +253,11 @@ class DemoRecorder(Node):
         current_time = self.get_clock().now().to_msg().sec + self.get_clock().now().to_msg().nanosec * 1e-9
         velocity = self.calculate_gripper_velocity(gripper_pose, current_time)
         
-        # Determine gripper state from actual width (>0.04 = open, <=0.04 = closed)
-        gripper_state = 'open' if self.latest_gripper_width > 0.04 else 'closed'
+        # Determine gripper state from actual width/position
+        if self.gripper_type == 'robotiq':
+            gripper_state = 'open' if self.robotiq_joint_position <= self.robotiq_toggle_threshold else 'closed'
+        else:
+            gripper_state = 'open' if self.latest_gripper_width > 0.04 else 'closed'
         
         # Check if gripper state changed
         gripper_state_changed = (self.prev_gripper_state is not None and 
@@ -276,71 +321,6 @@ class DemoRecorder(Node):
             except Exception:
                 pass
 
-    def check_controller_status(self):
-        """Check if impedance controller is active, restart if not"""
-        if self.controller_restarting:
-            return
-        # Check if service is available
-        if not self.list_controllers_client.wait_for_service(timeout_sec=0.5):
-            return
-        # Call list_controllers service
-        request = ListControllers.Request()
-        future = self.list_controllers_client.call_async(request)
-        future.add_done_callback(self._handle_controller_list)
-    
-    def _handle_controller_list(self, future):
-        """Handle controller list response"""
-        try:
-            response = future.result()
-            impedance_active = False
-            
-            for controller in response.controller:
-                if controller.name == self.impedance_controller_name:
-                    if controller.state == 'active':
-                        impedance_active = True
-                    break
-            
-            # If impedance controller is not active, restart it
-            if not impedance_active and not self.controller_restarting:
-                self.get_logger().warn('Impedance controller not active! Auto-restarting...')
-                threading.Thread(target=self._restart_impedance_controller, daemon=True).start()
-        except Exception as e:
-            self.get_logger().debug(f'Controller check error: {e}')
-    
-    def _restart_impedance_controller(self):
-        """Restart impedance controller using spawner"""
-        self.controller_restarting = True
-        print("\n" + "="*60)
-        print("[AUTO-RESTART] Impedance controller lost, restarting...")
-        print("="*60)
-        
-        try:
-            # Stop recording if active
-            if self.is_recording:
-                print("[AUTO-RESTART] Stopping current recording...")
-                self.is_recording = False
-            
-            # Spawn controller using ros2 control command
-            result = subprocess.run(
-                ['ros2', 'control', 'load_controller', '--set-state', 'active', 
-                 self.impedance_controller_name],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            if result.returncode == 0:
-                print("[AUTO-RESTART] Successfully restarted impedance controller")
-                print("[AUTO-RESTART] You can continue teaching...\n")
-            else:
-                print(f"[AUTO-RESTART] Failed to restart: {result.stderr}")
-                print("[AUTO-RESTART] Manual intervention required\n")
-        except Exception as e:
-            print(f"[AUTO-RESTART] Error: {e}")
-            print("[AUTO-RESTART] Manual restart required\n")
-        finally:
-            self.controller_restarting = False
-    
     def start_recording(self):
         if self.is_recording:
             self.get_logger().warn('Already recording!')
@@ -397,54 +377,21 @@ class DemoRecorder(Node):
         self.get_logger().info(f'Stopped recording. Saved {len(self.demo_data)} frames to {demo_dir}/')
         print(f"\n>>> DEMO {self.demo_count} SAVED ({len(self.demo_data)} frames) <<<")
 
-    def reset_to_position(self, target_position):
-        """Reset robot to target joint position using joint trajectory"""
-        print("\n[INFO] Attempting to reset to start position...")
-        
-        # Check if action server is available
-        print("[INFO] Checking joint trajectory action server...")
-        if not self.joint_trajectory_client.wait_for_server(timeout_sec=2.0):
-            print("[WARN] Joint trajectory action server not available!")
-            print("[WARN] This is expected if impedance controller is active.")
-            print("[WARN] Manual reset required or switch to joint_trajectory_controller.")
-            return
-        
-        print("[INFO] Joint trajectory server found, sending reset command...")
-        
-        # Create trajectory goal
-        goal_msg = FollowJointTrajectory.Goal()
-        trajectory_msg = JointTrajectory()
-        trajectory_msg.joint_names = [
-            'fr3_joint1', 'fr3_joint2', 'fr3_joint3', 'fr3_joint4',
-            'fr3_joint5', 'fr3_joint6', 'fr3_joint7'
-        ]
-        
-        point = JointTrajectoryPoint()
-        point.positions = target_position
-        point.velocities = [0.0] * 7
-        point.time_from_start = Duration(sec=5, nanosec=0)
-        
-        trajectory_msg.points = [point]
-        goal_msg.trajectory = trajectory_msg
-        
-        future = self.joint_trajectory_client.send_goal_async(goal_msg)
-        print("[INFO] Reset goal sent. Robot should move back in 5 seconds.")
-        
-        # Optional: wait for acceptance
-        def goal_response_callback(future_result):
-            goal_handle = future_result.result()
-            if goal_handle.accepted:
-                print("[OK] Reset goal accepted by controller")
-            else:
-                print("[ERROR] Reset goal rejected by controller")
-        
-        future.add_done_callback(goal_response_callback)
-
     def toggle_gripper(self):
         if not self.gripper_ready:
             print("!!! Gripper not ready")
             return
         # Determine current state from actual width
+        if self.gripper_type == 'robotiq':
+            if self._robotiq_goal_in_flight:
+                self.get_logger().info('Robotiq gripper is moving, command ignored')
+                return
+            if self.robotiq_joint_position > self.robotiq_toggle_threshold:
+                self.open_gripper()
+            else:
+                self.close_gripper()
+            return
+
         if self.latest_gripper_width > 0.04:
             self.close_gripper()
         else:
@@ -452,18 +399,87 @@ class DemoRecorder(Node):
 
     def send_gripper_command(self, width, speed=0.1):
         """Use Franka Move action for precise gripper control"""
+        if self.franka_move_client is None:
+            self.get_logger().warn('Franka move client not initialized')
+            return
         goal = Move.Goal()
         goal.width = width
         goal.speed = speed
         self.franka_move_client.send_goal_async(goal)
 
+    def move_robotiq_gripper(self, position, max_effort=50.0, timeout=5.0):
+        """Use Robotiq GripperCommand action for open/close control"""
+        if self.robotiq_gripper_client is None:
+            self.get_logger().warn('Robotiq gripper client not initialized')
+            return False
+
+        if self._robotiq_goal_in_flight:
+            self.get_logger().info('Robotiq gripper is moving, command ignored')
+            return False
+
+        if not self.robotiq_gripper_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Robotiq gripper action server not available')
+            return False
+
+        goal = GripperCommand.Goal()
+        goal.command.position = float(position)
+        goal.command.max_effort = float(max_effort)
+        send_future = self.robotiq_gripper_client.send_goal_async(goal)
+        self._robotiq_goal_in_flight = True
+
+        def _goal_response_cb(fut):
+            try:
+                handle = fut.result()
+            except Exception as exc:
+                self._robotiq_goal_in_flight = False
+                self.get_logger().warn(f'Gripper goal request failed: {exc}')
+                return
+
+            if not handle or not handle.accepted:
+                self._robotiq_goal_in_flight = False
+                self.get_logger().error('Gripper goal rejected')
+                return
+
+            self.gripper_ready = True
+            res_future = handle.get_result_async()
+
+            def _result_cb(result_fut):
+                self._robotiq_goal_in_flight = False
+                try:
+                    res = result_fut.result()
+                    if res is None:
+                        self.get_logger().warn('Gripper result is None')
+                        return
+                    self.get_logger().info(f'Gripper action finished with status={res.status}')
+                except Exception as exc:
+                    self.get_logger().warn(f'Gripper result error: {exc}')
+
+            res_future.add_done_callback(_result_cb)
+
+        send_future.add_done_callback(_goal_response_cb)
+        return True
+
+
     def open_gripper(self):
+        if self.gripper_type == 'robotiq':
+            print(">>> Opening Robotiq gripper")
+            self.move_robotiq_gripper(self.robotiq_open_position, max_effort=50.0)
+            return
+
         print(">>> Opening gripper")
         self.send_gripper_command(0.08, speed=0.1)
 
     def close_gripper(self):
+        if self.gripper_type == 'robotiq':
+            print(">>> Closing Robotiq gripper")
+            self.move_robotiq_gripper(self.robotiq_closed_position, max_effort=50.0)
+            return
+
         print(">>> Closing gripper (grasp)")
         # Use Grasp action for closing
+        if self.franka_grasp_client is None:
+            self.get_logger().warn('Franka grasp client not initialized')
+            return
         grasp_goal = Grasp.Goal()
         grasp_goal.width = 0.0
         grasp_goal.speed = 0.1

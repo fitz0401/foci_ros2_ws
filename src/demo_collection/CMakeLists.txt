@@ -22,6 +22,7 @@ install(DIRECTORY
 # Install scripts
 install(PROGRAMS
   scripts/demo_recorder.py
+  scripts/video_recorder.py
   scripts/keyboard_publisher.py
   scripts/joystick_publisher.py
   DESTINATION lib/${PROJECT_NAME}
