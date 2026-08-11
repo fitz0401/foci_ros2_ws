@@ -35,6 +35,24 @@ class FOCINode(Node):
     def __init__(self):
         super().__init__('foci_node')
         self.gripper_type = self.declare_parameter('gripper', 'franka').value.lower().strip()
+        self.zmq_bind_address = self.declare_parameter(
+            'zmq_bind_address', 'tcp://*:5555').value
+        self.planner_endpoint = self.declare_parameter(
+            'planner_endpoint', 'tcp://localhost:5556').value
+        self.color_topic = self.declare_parameter('color_topic', '/camera/color/image_raw').value
+        self.depth_topic = self.declare_parameter(
+            'depth_topic', '/camera/aligned_depth_to_color/image_raw').value
+        self.camera_info_topic = self.declare_parameter(
+            'camera_info_topic', '/camera/color/camera_info').value
+        self.base_frame = self.declare_parameter('base_frame', 'fr3_link0').value
+        self.camera_frame = self.declare_parameter(
+            'camera_frame', 'camera_color_optical_frame').value
+        self.ee_frame = self.declare_parameter('ee_frame', 'fr3_hand_tcp').value
+        self.depth_scale = float(self.declare_parameter('depth_scale', 0.001).value)
+        self.min_depth = float(self.declare_parameter('min_depth', 0.01).value)
+        self.max_depth = float(self.declare_parameter('max_depth', 3.0).value)
+        self.table_height = float(self.declare_parameter('table_height', 0.04).value)
+        self.max_point_count = int(self.declare_parameter('max_point_count', 2048).value)
         if self.gripper_type not in ('franka', 'robotiq'):
             self.get_logger().warn(
                 f"Unknown gripper type '{self.gripper_type}', fallback to 'franka'"
@@ -52,8 +70,8 @@ class FOCINode(Node):
         self.zmq_context = zmq.Context()
         self.socket = self.zmq_context.socket(zmq.REP)
         self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
-        self.socket.bind("tcp://*:5555")
-        self.get_logger().info('ZMQ server listening on port 5555')
+        self.socket.bind(self.zmq_bind_address)
+        self.get_logger().info(f'ZMQ server listening at {self.zmq_bind_address}')
         self.get_logger().info(f'Using gripper type: {self.gripper_type}')
         
         # CV Bridge for image conversion
@@ -71,9 +89,9 @@ class FOCINode(Node):
         self.cached_point_cloud = None
         
         # ROS2 subscribers
-        self.color_sub = self.create_subscription(Image, '/camera/color/image_raw', self.color_callback, 10)
-        self.depth_sub = self.create_subscription(Image, '/camera/aligned_depth_to_color/image_raw', self.depth_callback, 10)
-        self.camera_info_sub = self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10) 
+        self.color_sub = self.create_subscription(Image, self.color_topic, self.color_callback, 10)
+        self.depth_sub = self.create_subscription(Image, self.depth_topic, self.depth_callback, 10)
+        self.camera_info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
         gripper_joint_topic = '/robotiq/joint_states' if self.gripper_type == 'robotiq' else '/fr3_gripper/joint_states'
         self.gripper_state_sub = self.create_subscription(JointState, gripper_joint_topic, self.gripper_state_callback, 10)
         
@@ -102,7 +120,7 @@ class FOCINode(Node):
         self.zmq_thread.start()
 
         # Motion planning interface
-        self.pc = PandaCommander()
+        self.pc = PandaCommander(planner_endpoint=self.planner_endpoint)
     
     def color_callback(self, msg):
         self.latest_color = msg
@@ -165,16 +183,16 @@ class FOCINode(Node):
         """ Convert depth image to point cloud, optionally filtering by mask """
         depth = depth.astype(np.float32)
         depth_filtered = cv2.bilateralFilter(depth, d=5, sigmaColor=10, sigmaSpace=10)
-        depth = depth_filtered.astype(np.float32) / 1000.0  # mm to meters
+        depth = depth_filtered.astype(np.float32) * self.depth_scale
         h, w = depth.shape
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
         v, u = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
         # Filter valid depth points
         if mask is not None:
-            valid = (mask > 0) & (depth > 0.01) & (depth < 3.0)
+            valid = (mask > 0) & (depth > self.min_depth) & (depth < self.max_depth)
         else:
-            valid = (depth > 0.01) & (depth < 3.0)
+            valid = (depth > self.min_depth) & (depth < self.max_depth)
         u_valid = u[valid]
         v_valid = v[valid]
         z_valid = depth[valid]
@@ -184,10 +202,9 @@ class FOCINode(Node):
         z = z_valid
         point_cloud = np.stack([x, y, z], axis=1)
         point_cloud_world = (cam_extrinsic[:3, :3] @ point_cloud.T).T + cam_extrinsic[:3, 3]
-        point_cloud_world_without_table = point_cloud_world[point_cloud_world[:, 2] > 0.04]
-        max_points = 2048
-        if point_cloud_world_without_table.shape[0] > max_points:
-            idx = np.random.choice(point_cloud_world_without_table.shape[0], max_points, replace=False)
+        point_cloud_world_without_table = point_cloud_world[point_cloud_world[:, 2] > self.table_height]
+        if point_cloud_world_without_table.shape[0] > self.max_point_count:
+            idx = np.random.choice(point_cloud_world_without_table.shape[0], self.max_point_count, replace=False)
             point_cloud_world_without_table = point_cloud_world_without_table[idx]
         return point_cloud_world_without_table
     
@@ -217,11 +234,11 @@ class FOCINode(Node):
         # Get camera intrinsics
         K = np.array(self.latest_camera_info.k).reshape(3, 3)
         # Get camera extrinsics (fr3_link0 -> camera_color_optical_frame)
-        cam_extrinsic = self.get_transform('fr3_link0', 'camera_color_optical_frame')
+        cam_extrinsic = self.get_transform(self.base_frame, self.camera_frame)
         if cam_extrinsic is None:
             return {'status': 'failed', 'message': 'Failed to get camera extrinsics'}
         # Get gripper pose (fr3_link0 -> fr3_hand_tcp)
-        gripper_pose = self.get_transform('fr3_link0', 'fr3_hand_tcp')
+        gripper_pose = self.get_transform(self.base_frame, self.ee_frame)
         if gripper_pose is None:
             return {'status': 'failed', 'message': 'Failed to get gripper pose'}
         # Calculate gripper open ratio (0=closed, 1=open)
@@ -279,7 +296,7 @@ class FOCINode(Node):
                     depth = self.bridge.imgmsg_to_cv2(self.latest_depth, 'passthrough')
                     K = np.array(self.latest_camera_info.k).reshape(3, 3)
                     # Transform to robot base frame (fr3_link0)
-                    cam_extrinsic = self.get_transform('fr3_link0', 'camera_color_optical_frame')
+                    cam_extrinsic = self.get_transform(self.base_frame, self.camera_frame)
                     cam_extrinsic = np.array(cam_extrinsic['matrix'])
                     # Convert depth to point cloud (in world frame)
                     point_cloud = self.depth_to_point_cloud(depth, K, cam_extrinsic)
@@ -427,7 +444,7 @@ class FOCINode(Node):
             # Add sphere markers for waypoints
             for i, pose_matrix in enumerate(poses):
                 marker = Marker()
-                marker.header.frame_id = 'fr3_link0'
+                marker.header.frame_id = self.base_frame
                 marker.header.stamp = self.get_clock().now().to_msg()
                 marker.ns = f'trajectory_{mode}'
                 marker.id = i
@@ -459,7 +476,7 @@ class FOCINode(Node):
             # Add line strip connecting waypoints
             if len(poses) > 1:
                 line_marker = Marker()
-                line_marker.header.frame_id = 'fr3_link0'
+                line_marker.header.frame_id = self.base_frame
                 line_marker.header.stamp = self.get_clock().now().to_msg()
                 line_marker.ns = f'trajectory_{mode}_line'
                 line_marker.id = 0

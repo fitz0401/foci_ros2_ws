@@ -1,101 +1,85 @@
-from launch import LaunchDescription
-from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable, DeclareLaunchArgument
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
-from launch_ros.substitutions import FindPackageShare
-from ament_index_python.packages import get_package_share_directory
 import os
+import yaml
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
+
+
+def _tf_arguments(transform, parent, child):
+    xyz = transform['translation']
+    quat = transform['quaternion']
+    return [
+        '--x', str(xyz[0]), '--y', str(xyz[1]), '--z', str(xyz[2]),
+        '--qx', str(quat[0]), '--qy', str(quat[1]),
+        '--qz', str(quat[2]), '--qw', str(quat[3]),
+        '--frame-id', parent, '--child-frame-id', child,
+    ]
 
 
 def generate_launch_description():
-    gripper_arg = DeclareLaunchArgument(
-        'gripper',
-        default_value='franka',
-        description='Gripper type: franka or robotiq'
-    )
-    gripper = LaunchConfiguration('gripper')
+    package_share = get_package_share_directory('foci_policy')
+    config_path = os.path.join(package_share, 'config', 'foci.yaml')
+    with open(config_path, encoding='utf-8') as config_file:
+        config = yaml.safe_load(config_file)
 
-    # Suppress RealSense warnings
-    suppress_realsense_warnings = SetEnvironmentVariable('LRS_LOG_LEVEL', 'error')
-    suppress_usb_warnings = SetEnvironmentVariable('LIBUSB_LOG_LEVEL', '1')
-    
-    # RealSense Camera
+    camera = config['camera']
+    frames = config['frames']
+    transforms = config['transforms']
+    node_params = config['foci_node']['ros__parameters'].copy()
+    node_params.update({
+        'base_frame': frames['base'],
+        'camera_frame': frames['camera_optical'],
+        'ee_frame': frames['end_effector'],
+    })
+
+    realsense_share = get_package_share_directory('realsense2_camera')
     realsense_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            os.path.join(
-                FindPackageShare('realsense2_camera').find('realsense2_camera'),
-                'launch',
-                'rs_launch.py'
-            )
-        ]),
+        PythonLaunchDescriptionSource(
+            os.path.join(realsense_share, 'launch', 'rs_launch.py')),
         launch_arguments={
-            'depth_module.depth_profile': '640x480x30',
-            'rgb_camera.color_profile': '640x480x30',
+            'depth_module.depth_profile': str(camera['profile']),
+            'rgb_camera.color_profile': str(camera['profile']),
             'enable_color': 'true',
             'enable_depth': 'true',
             'pointcloud.enable': 'true',
             'align_depth.enable': 'true',
             'log_level': 'error',
-        }.items()
+            'serial_no': str(camera['serial']),
+        }.items(),
     )
 
-    # TF: fr3_link0 → ref_frame
-    tf_fr3_to_ref = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
+    tf_base_to_ref = Node(
+        package='tf2_ros', executable='static_transform_publisher',
         name='static_tf_fr3_to_ref',
-        arguments=[
-            '0.749022', '0.656649', '0.659689',
-            '-0.382599', '-0.868189', '0.293314', '0.117616',
-            'fr3_link0', 'ref_frame'
-        ]
+        arguments=_tf_arguments(
+            transforms['base_to_reference'], frames['base'], frames['reference']),
     )
-
-    # TF: ref_frame → camera_link
-    tf_ref_to_cam = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
+    tf_ref_to_camera = Node(
+        package='tf2_ros', executable='static_transform_publisher',
         name='static_tf_ref_to_cam',
-        arguments=[
-            '-0.0010067', '0.014068', '-0.002151',
-            '0.49272', '-0.49219', '0.50886', '0.50601',
-            'ref_frame', 'camera_link'
-        ]
+        arguments=_tf_arguments(
+            transforms['reference_to_camera'], frames['reference'], frames['camera_link']),
     )
 
-    # RViz for visualization
-    rviz_config_path = os.path.join(
-        FindPackageShare('demo_collection').find('demo_collection'),
-        'config', 'fr3_rviz_config.rviz'
-    )
-    
-    # Check if rviz config exists, otherwise skip
+    rviz_config = os.path.join(
+        get_package_share_directory('demo_collection'), 'config', 'fr3_rviz_config.rviz')
     rviz_nodes = []
-    if os.path.exists(rviz_config_path):
+    if os.path.exists(rviz_config):
         rviz_nodes.append(Node(
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            arguments=['-d', rviz_config_path],
-            output='screen'
-        ))
-
-    # FOCI Node (ZMQ bridge with PandaCommander)
-    foci_node = Node(
-        package='foci_policy',
-        executable='foci_node.py',
-        name='foci_node',
-        parameters=[{'gripper': gripper}],
-        output='screen',
-    )
+            package='rviz2', executable='rviz2', name='rviz2',
+            arguments=['-d', rviz_config], output='screen'))
 
     return LaunchDescription([
-        gripper_arg,
-        suppress_realsense_warnings,
-        suppress_usb_warnings,
-        tf_fr3_to_ref,
-        tf_ref_to_cam,
+        SetEnvironmentVariable('LRS_LOG_LEVEL', 'error'),
+        SetEnvironmentVariable('LIBUSB_LOG_LEVEL', '1'),
+        tf_base_to_ref,
+        tf_ref_to_camera,
         realsense_launch,
-        foci_node,
-    ] + rviz_nodes)
+        Node(
+            package='foci_policy', executable='foci_node.py', name='foci_node',
+            parameters=[node_params], output='screen'),
+        *rviz_nodes,
+    ])

@@ -21,7 +21,7 @@ install(DIRECTORY motion_planning/
 
 # Install launch files
 install(DIRECTORY
-  launch
+  launch config
   DESTINATION share/${PROJECT_NAME}/
 )
 

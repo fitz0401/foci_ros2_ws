@@ -1,97 +1,54 @@
+import os
+import yaml
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
-import os
+
+
+def _tf_arguments(transform, parent, child):
+    xyz, quat = transform['translation'], transform['quaternion']
+    return [
+        '--x', str(xyz[0]), '--y', str(xyz[1]), '--z', str(xyz[2]),
+        '--qx', str(quat[0]), '--qy', str(quat[1]), '--qz', str(quat[2]), '--qw', str(quat[3]),
+        '--frame-id', parent, '--child-frame-id', child,
+    ]
 
 
 def generate_launch_description():
-    # Suppress RealSense warnings
-    suppress_realsense_warnings = SetEnvironmentVariable('LRS_LOG_LEVEL', 'error')
-    suppress_usb_warnings = SetEnvironmentVariable('LIBUSB_LOG_LEVEL', '1')
-
-    joy_node = Node(
-        package='joy',
-        executable='joy_node',
-        name='joy_node',
-        output='screen',
-    )
+    package_share = get_package_share_directory('demo_collection')
+    with open(os.path.join(package_share, 'config', 'demo_collection.yaml'), encoding='utf-8') as stream:
+        config = yaml.safe_load(stream)
+    camera, frames, transforms = config['camera'], config['frames'], config['transforms']
+    recorder_params = config['video_recorder']['ros__parameters'].copy()
+    recorder_params.update({'base_frame': frames['base'], 'camera_frame': frames['camera_optical']})
 
     realsense_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            os.path.join(
-                FindPackageShare('realsense2_camera').find('realsense2_camera'),
-                'launch',
-                'rs_launch.py'
-            )
-        ]),
+        PythonLaunchDescriptionSource(os.path.join(
+            get_package_share_directory('realsense2_camera'), 'launch', 'rs_launch.py')),
         launch_arguments={
-            'depth_module.depth_profile': '640x480x30',
-            'rgb_camera.color_profile': '640x480x30',
-            'enable_color': 'true',
-            'enable_depth': 'true',
-            'pointcloud.enable': 'true',
-            'align_depth.enable': 'true',
-        }.items()
-    )
-
-    tf_fr3_to_ref = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='static_tf_fr3_to_ref',
-        arguments=[
-            '0.749022', '0.656649', '0.659689',
-            '-0.382599', '-0.868189', '0.293314', '0.117616',
-            'fr3_link0', 'ref_frame'
-        ]
-    )
-
-    tf_ref_to_cam = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='static_tf_ref_to_cam',
-        arguments=[
-            '-0.0010067', '0.014068', '-0.002151',
-            '0.49272', '-0.49219', '0.50886', '0.50601',
-            'ref_frame', 'camera_link'
-        ]
-    )
-
-    video_recorder = Node(
-        package='demo_collection',
-        executable='video_recorder.py',
-        name='video_recorder',
-        output='screen',
-    )
-
-    joystick_publisher = Node(
-        package='demo_collection',
-        executable='joystick_publisher.py',
-        name='joystick_publisher',
-        output='screen',
-    )
-
-    # RViz
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        arguments=['-d', os.path.join(
-            FindPackageShare('demo_collection').find('demo_collection'),
-            'config', 'fr3_rviz_config.rviz'
-        )],
-        output='screen'
-    )
+            'depth_module.depth_profile': str(camera['profile']),
+            'rgb_camera.color_profile': str(camera['profile']),
+            'enable_color': 'true', 'enable_depth': 'true',
+            'pointcloud.enable': 'true', 'align_depth.enable': 'true',
+            'serial_no': str(camera['serial']),
+        }.items())
 
     return LaunchDescription([
-        suppress_realsense_warnings,
-        suppress_usb_warnings,
-        joy_node,
-        rviz_node,
-        tf_fr3_to_ref,
-        tf_ref_to_cam,
+        SetEnvironmentVariable('LRS_LOG_LEVEL', 'error'),
+        SetEnvironmentVariable('LIBUSB_LOG_LEVEL', '1'),
+        Node(package='joy', executable='joy_node', name='joy_node', output='screen'),
+        Node(package='rviz2', executable='rviz2', name='rviz2',
+             arguments=['-d', os.path.join(package_share, 'config', 'fr3_rviz_config.rviz')],
+             output='screen'),
+        Node(package='tf2_ros', executable='static_transform_publisher', name='static_tf_fr3_to_ref',
+             arguments=_tf_arguments(transforms['base_to_reference'], frames['base'], frames['reference'])),
+        Node(package='tf2_ros', executable='static_transform_publisher', name='static_tf_ref_to_cam',
+             arguments=_tf_arguments(transforms['reference_to_camera'], frames['reference'], frames['camera_link'])),
         realsense_launch,
-        video_recorder,
-        joystick_publisher,
+        Node(package='demo_collection', executable='video_recorder.py', name='video_recorder',
+             parameters=[recorder_params], output='screen'),
+        Node(package='demo_collection', executable='joystick_publisher.py', name='joystick_publisher', output='screen'),
     ])

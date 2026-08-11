@@ -8,6 +8,7 @@
   <license>Apache 2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <exec_depend>franka_description</exec_depend>
   <exec_depend>franka_hardware</exec_depend>

@@ -19,16 +19,27 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
-VIDEO_BASE_DIR = '/home/u0177383/doi_policy/foci_real_world/dataset/video_dataset'
-os.makedirs(VIDEO_BASE_DIR, exist_ok=True)
-
-# Minimum interval between saved frames (seconds).  ~10 fps.
-MIN_FRAME_INTERVAL = 0.1
-
-
 class VideoRecorder(Node):
     def __init__(self):
         super().__init__('video_recorder')
+
+        default_output = os.path.join(os.getcwd(), 'dataset', 'video_dataset')
+        self.output_dir = os.path.abspath(os.path.expanduser(
+            self.declare_parameter('output_dir', default_output).value))
+        self.min_frame_interval = float(
+            self.declare_parameter('min_frame_interval', 0.1).value)
+        self.color_topic = self.declare_parameter(
+            'color_topic', '/camera/color/image_raw').value
+        self.depth_topic = self.declare_parameter(
+            'depth_topic', '/camera/aligned_depth_to_color/image_raw').value
+        self.camera_info_topic = self.declare_parameter(
+            'camera_info_topic', '/camera/color/camera_info').value
+        self.command_topic = self.declare_parameter(
+            'command_topic', '/demo_commands').value
+        self.base_frame = self.declare_parameter('base_frame', 'fr3_link0').value
+        self.camera_frame = self.declare_parameter(
+            'camera_frame', 'camera_color_optical_frame').value
+        os.makedirs(self.output_dir, exist_ok=True)
 
         self.bridge = CvBridge()
         self.tf_buffer = Buffer()
@@ -41,15 +52,15 @@ class VideoRecorder(Node):
         self.last_save_time = 0.0
 
         # Synchronized RGB-D subscription
-        color_sub = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
-        depth_sub = message_filters.Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
+        color_sub = message_filters.Subscriber(self, Image, self.color_topic)
+        depth_sub = message_filters.Subscriber(self, Image, self.depth_topic)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [color_sub, depth_sub], queue_size=10, slop=0.05)
         self.sync.registerCallback(self.rgbd_callback)
 
-        self.create_subscription(CameraInfo, '/camera/color/camera_info',
+        self.create_subscription(CameraInfo, self.camera_info_topic,
                                  lambda m: setattr(self, 'latest_camera_info', m), 10)
-        self.create_subscription(String, '/demo_commands', self.command_callback, 10)
+        self.create_subscription(String, self.command_topic, self.command_callback, 10)
 
         self.get_logger().info("Ready.  Send 'r' to start, 's' to stop.")
 
@@ -67,7 +78,7 @@ class VideoRecorder(Node):
             return
 
         now = time.monotonic()
-        if now - self.last_save_time < MIN_FRAME_INTERVAL:
+        if now - self.last_save_time < self.min_frame_interval:
             return
         self.last_save_time = now
 
@@ -82,8 +93,12 @@ class VideoRecorder(Node):
         stamp = color_msg.header.stamp
         ts = stamp.sec + stamp.nanosec * 1e-9
 
-        cv2.imwrite(os.path.join(self.record_dir, 'color', f'{idx:05d}.png'), color)
-        cv2.imwrite(os.path.join(self.record_dir, 'depth', f'{idx:05d}.png'), depth)
+        color_path = os.path.join(self.record_dir, 'color', f'{idx:05d}.png')
+        depth_path = os.path.join(self.record_dir, 'depth', f'{idx:05d}.png')
+        cv2.imwrite(color_path, color)
+        cv2.imwrite(depth_path, depth)
+        self._set_permission(color_path)
+        self._set_permission(depth_path)
 
         self.frame_meta.append({'frame_idx': idx, 'timestamp': ts})
         self.get_logger().info(f'Saved frame {idx}', throttle_duration_sec=1.0)
@@ -95,13 +110,16 @@ class VideoRecorder(Node):
             return
 
         idx = max(
-            (int(n[6:9]) for n in os.listdir(VIDEO_BASE_DIR)
+            (int(n[6:9]) for n in os.listdir(self.output_dir)
              if n.startswith('video_') and n[6:9].isdigit()),
             default=-1
         ) + 1
-        self.record_dir = os.path.join(VIDEO_BASE_DIR, f'video_{idx:03d}')
+        self.record_dir = os.path.join(self.output_dir, f'video_{idx:03d}')
         os.makedirs(os.path.join(self.record_dir, 'color'), exist_ok=True)
         os.makedirs(os.path.join(self.record_dir, 'depth'), exist_ok=True)
+        self._set_permission(self.record_dir)
+        self._set_permission(os.path.join(self.record_dir, 'color'))
+        self._set_permission(os.path.join(self.record_dir, 'depth'))
 
         self.frame_meta = []
         self.last_save_time = 0.0
@@ -113,19 +131,23 @@ class VideoRecorder(Node):
             intrinsics = {'width': ci.width, 'height': ci.height,
                           'K': list(ci.k), 'D': list(ci.d),
                           'distortion_model': ci.distortion_model}
-            with open(os.path.join(self.record_dir, 'camera_intrinsics.json'), 'w') as f:
+            intrinsics_path = os.path.join(self.record_dir, 'camera_intrinsics.json')
+            with open(intrinsics_path, 'w') as f:
                 json.dump(intrinsics, f, indent=2)
+            self._set_permission(intrinsics_path)
 
         # Save extrinsics once
         try:
             tf = self.tf_buffer.lookup_transform(
-                'fr3_link0', 'camera_color_optical_frame',
+                self.base_frame, self.camera_frame,
                 rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.5))
             t, r = tf.transform.translation, tf.transform.rotation
             extrinsics = {'translation': {'x': t.x, 'y': t.y, 'z': t.z},
                           'rotation':    {'x': r.x, 'y': r.y, 'z': r.z, 'w': r.w}}
-            with open(os.path.join(self.record_dir, 'camera_extrinsics.json'), 'w') as f:
+            extrinsics_path = os.path.join(self.record_dir, 'camera_extrinsics.json')
+            with open(extrinsics_path, 'w') as f:
                 json.dump(extrinsics, f, indent=2)
+            self._set_permission(extrinsics_path)
         except Exception as e:
             self.get_logger().warn(f'Extrinsics unavailable: {e}')
 
@@ -135,10 +157,18 @@ class VideoRecorder(Node):
         if not self.is_recording:
             return
         self.is_recording = False
-        with open(os.path.join(self.record_dir, 'frames.json'), 'w') as f:
+        frames_path = os.path.join(self.record_dir, 'frames.json')
+        with open(frames_path, 'w') as f:
             json.dump(self.frame_meta, f, indent=2)
+        self._set_permission(frames_path)
         self.get_logger().info(f'Saved {len(self.frame_meta)} frames -> {self.record_dir}')
         self.record_dir = None
+
+    def _set_permission(self, path):
+        try:
+            os.chmod(path, 0o777)
+        except Exception as e:
+            self.get_logger().warn(f'Failed to chmod {path}: {e}')
 
 
 def main(args=None):

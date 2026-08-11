@@ -30,11 +30,12 @@ from motion_planning.transform import Transform, reorder_pose_list, Rotation, ma
 
 
 class MotionPlannerClient:
-    def __init__(self, host='localhost', port=5556):
+    def __init__(self, endpoint='tcp://localhost:5556'):
+        self.endpoint = endpoint
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect(f"tcp://{host}:{port}")
-        print(f"[MotionClient] Connected to Motion Server at {port}")
+        self.socket.connect(self.endpoint)
+        print(f"[MotionClient] Connected to Motion Server at {self.endpoint}")
         
         try:
             self.socket.send(pickle.dumps({'cmd': 'ping'}))
@@ -96,12 +97,12 @@ class MotionPlannerClient:
         self.context.term()
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect("tcp://localhost:5556")
+        self.socket.connect(self.endpoint)
 
 
 class PandaCommander(Node):
     """ FR3 Robot Controller with ZMQ Motion Planner """
-    def __init__(self, robot_name: str = "fr3"):
+    def __init__(self, robot_name: str = "fr3", planner_endpoint: str = "tcp://localhost:5556"):
         super().__init__('fr3_controller')
         self.callback_group = ReentrantCallbackGroup()
         
@@ -132,8 +133,8 @@ class PandaCommander(Node):
         
         # --- ROS Subs/Pubs ---
         self.joint_state_sub = self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 1, callback_group=self.callback_group)
-        # self.joint_velo_pub = self.create_publisher(JointState, '/joint_velocity_controller/joint_velocity', 1, callback_group=self.callback_group)
-        self.joint_velo_pub = self.create_publisher(JointState, '/joint_impedance_controller/joint_velocity', 1, callback_group=self.callback_group)
+        self.joint_velo_pub = self.create_publisher(JointState, '/joint_velocity_controller/joint_velocity', 1, callback_group=self.callback_group)
+        # self.joint_velo_pub = self.create_publisher(JointState, '/joint_impedance_controller/joint_velocity', 1, callback_group=self.callback_group)
         self.predicted_path_pub = self.create_publisher(Path, '/planned_trajectory', 1, callback_group=self.callback_group)
         self.force_sub = self.create_subscription(FrankaRobotState, "/franka_robot_state_broadcaster/robot_state", self.force_callback, 10, callback_group=self.callback_group)
         self.robot_state_sub = self.create_subscription(FrankaRobotState, '/franka_robot_state_broadcaster/robot_state', self.robot_state_cb, 10, callback_group=self.callback_group)
@@ -143,7 +144,7 @@ class PandaCommander(Node):
         self.move_client = ActionClient(self, Move, f'/{self.robot_name}_gripper/move', callback_group=self.callback_group)
         self.error_recovery_client = ActionClient(self, ErrorRecovery, '/action_server/error_recovery', callback_group=self.callback_group)
         self.collision_client = self.create_client(SetForceTorqueCollisionBehavior, '/service_server/set_force_torque_collision_behavior')
-        self.planner = MotionPlannerClient() 
+        self.planner = MotionPlannerClient(planner_endpoint)
         
         # PID & Limits
         self.kp = 1.0

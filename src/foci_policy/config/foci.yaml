@@ -1,0 +1,34 @@
+# Edit this file for the target deployment before launching.
+camera:
+  serial: "f1421698"
+  profile: "640x480x30"
+
+frames:
+  base: "fr3_link0"
+  reference: "ref_frame"
+  camera_link: "camera_link"
+  camera_optical: "camera_color_optical_frame"
+  end_effector: "fr3_hand_tcp"
+
+# Translation is in metres; quaternion order is [x, y, z, w].
+transforms:
+  base_to_reference:
+    translation: [0.749022, 0.656649, 0.659689]
+    quaternion: [-0.382599, -0.868189, 0.293314, 0.117616]
+  reference_to_camera:
+    translation: [-0.0010067, 0.014068, -0.002151]
+    quaternion: [0.49272, -0.49219, 0.50886, 0.50601]
+
+foci_node:
+  ros__parameters:
+    gripper: "franka"
+    zmq_bind_address: "tcp://*:5555"
+    planner_endpoint: "tcp://localhost:5556"
+    color_topic: "/camera/color/image_raw"
+    depth_topic: "/camera/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera/color/camera_info"
+    depth_scale: 0.001
+    min_depth: 0.01
+    max_depth: 3.0
+    table_height: 0.04
+    max_point_count: 2048

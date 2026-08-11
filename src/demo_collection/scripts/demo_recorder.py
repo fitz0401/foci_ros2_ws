@@ -24,14 +24,26 @@ from cv_bridge import CvBridge
 from queue import Queue
 
 
-demo_base_dir = '/home/u0177383/doi_policy/foci_real_world/dataset'
-os.makedirs(demo_base_dir, exist_ok=True)
-
-
 class DemoRecorder(Node):
     def __init__(self):
         super().__init__('demo_recorder')
         self.gripper_type = self.declare_parameter('gripper', 'franka').value.lower().strip()
+        default_output = os.path.join(os.getcwd(), 'dataset')
+        self.output_dir = os.path.abspath(os.path.expanduser(
+            self.declare_parameter('output_dir', default_output).value))
+        self.color_topic = self.declare_parameter('color_topic', '/camera/color/image_raw').value
+        self.depth_topic = self.declare_parameter(
+            'depth_topic', '/camera/aligned_depth_to_color/image_raw').value
+        self.camera_info_topic = self.declare_parameter(
+            'camera_info_topic', '/camera/color/camera_info').value
+        self.command_topic = self.declare_parameter('command_topic', '/demo_commands').value
+        self.base_frame = self.declare_parameter('base_frame', 'fr3_link0').value
+        self.ee_frame = self.declare_parameter('ee_frame', 'fr3_hand_tcp').value
+        self.camera_frame = self.declare_parameter(
+            'camera_frame', 'camera_color_optical_frame').value
+        self.record_rate = float(self.declare_parameter('record_rate', 5.0).value)
+        self.min_velocity = float(self.declare_parameter('min_velocity', 0.001).value)
+        os.makedirs(self.output_dir, exist_ok=True)
         if self.gripper_type not in ('franka', 'robotiq'):
             self.get_logger().warn(
                 f"Unknown gripper type '{self.gripper_type}', fallback to 'franka'"
@@ -67,11 +79,11 @@ class DemoRecorder(Node):
         # CV Bridge for image conversion
         self.bridge = CvBridge()
         # Subscribers
-        self.color_sub = self.create_subscription(Image, '/camera/color/image_raw', self.color_callback, 10)
-        self.depth_sub = self.create_subscription(Image, '/camera/aligned_depth_to_color/image_raw', self.depth_callback, 10)
-        self.camera_info_sub = self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
+        self.color_sub = self.create_subscription(Image, self.color_topic, self.color_callback, 10)
+        self.depth_sub = self.create_subscription(Image, self.depth_topic, self.depth_callback, 10)
+        self.camera_info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
         self.gripper_state_sub = self.create_subscription(JointState, gripper_joint_topic, self.gripper_state_callback, 10)
-        self.command_sub = self.create_subscription(String, '/demo_commands', self.command_callback, 10)
+        self.command_sub = self.create_subscription(String, self.command_topic, self.command_callback, 10)
         # Data storage
         self.latest_color = None
         self.latest_depth = None
@@ -92,7 +104,9 @@ class DemoRecorder(Node):
         self.save_thread = threading.Thread(target=self._save_worker, daemon=True)
         self.save_thread.start()
         # Recording timer (5 Hz)
-        self.record_timer = self.create_timer(0.2, self.record_frame)
+        if self.record_rate <= 0.0:
+            raise ValueError('record_rate must be greater than zero')
+        self.record_timer = self.create_timer(1.0 / self.record_rate, self.record_frame)
         # Gripper homing (non-blocking)
         self.gripper_ready = False
         threading.Thread(target=self._init_gripper, daemon=True).start()
@@ -169,7 +183,7 @@ class DemoRecorder(Node):
     def get_gripper_pose(self):
         try:
             transform = self.tf_buffer.lookup_transform(
-                'fr3_link0', 'fr3_hand_tcp', rclpy.time.Time(),
+                self.base_frame, self.ee_frame, rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1)
             )
             pose = {
@@ -193,7 +207,7 @@ class DemoRecorder(Node):
     def get_camera_extrinsics(self):
         try:
             transform = self.tf_buffer.lookup_transform(
-                'fr3_link0', 'camera_color_optical_frame', rclpy.time.Time(),
+                self.base_frame, self.camera_frame, rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1)
             )
             extrinsics = {
@@ -264,7 +278,7 @@ class DemoRecorder(Node):
                                  gripper_state != self.prev_gripper_state)
         
         # Skip frame if velocity is too low AND gripper state hasn't changed
-        if velocity < 0.001 and not gripper_state_changed:
+        if velocity < self.min_velocity and not gripper_state_changed:
             return
         
         # Update previous gripper state
@@ -282,7 +296,7 @@ class DemoRecorder(Node):
             self.get_logger().info(f'Recording frame {frame_idx}... (vel: {velocity:.4f} m/s)')
 
     def save_frame_data(self, frame_idx):
-        demo_dir = f'{demo_base_dir}/demo_{self.demo_count:03d}'
+        demo_dir = os.path.join(self.output_dir, f'demo_{self.demo_count:03d}')
         save_data = {
             'demo_dir': demo_dir,
             'frame_idx': frame_idx,
@@ -326,13 +340,13 @@ class DemoRecorder(Node):
             self.get_logger().warn('Already recording!')
             return
         max_idx = 0
-        for name in os.listdir(demo_base_dir):
+        for name in os.listdir(self.output_dir):
             if name.startswith('demo_') and name[5:8].isdigit():
                 idx = int(name[5:8])
                 if idx > max_idx:
                     max_idx = idx
         self.demo_count = max_idx + 1
-        demo_dir = f'{demo_base_dir}/demo_{self.demo_count:03d}'
+        demo_dir = os.path.join(self.output_dir, f'demo_{self.demo_count:03d}')
         os.makedirs(demo_dir, exist_ok=True)
         os.chmod(demo_dir, 0o777)
         # Create subdirectories for images
@@ -370,7 +384,7 @@ class DemoRecorder(Node):
             self.get_logger().warn('Not recording!')
             return
         self.is_recording = False
-        demo_dir = f'{demo_base_dir}/demo_{self.demo_count:03d}'
+        demo_dir = os.path.join(self.output_dir, f'demo_{self.demo_count:03d}')
         with open(os.path.join(demo_dir, 'trajectory.json'), 'w') as f:
             json.dump(self.demo_data, f, indent=2)
         os.chmod(os.path.join(demo_dir, 'trajectory.json'), 0o777)

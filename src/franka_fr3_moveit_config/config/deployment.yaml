@@ -1,0 +1,4 @@
+# Edit these values for the target robot before launching.
+robot_ip: "172.16.0.2"
+use_fake_hardware: false
+fake_sensor_commands: false
